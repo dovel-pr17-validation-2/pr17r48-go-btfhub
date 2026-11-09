@@ -1,0 +1,305 @@
+name: Commit, Push and Create PR
+
+description: Commit changes, push to a timestamped branch, and create a PR. Distro names are auto-detected from changed file paths.
+
+inputs:
+  directory:
+    description: Path to the archive checkout (relative, inside workspace, git repo)
+    required: true
+  repository:
+    description: Target repository (owner/name)
+    required: true
+  branch-prefix:
+    description: Branch name prefix (must match ci/<name>, name = lowercase letters, digits, hyphens)
+    required: true
+  app-client-id:
+    description: GitHub App client ID for push and PR creation
+    required: true
+  app-private-key:
+    description: GitHub App private key for push and PR creation
+    required: true
+  dry-run:
+    description: "Test credential flow: create a mock change, push, then delete the branch (no PR created)"
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Parse and validate inputs
+      id: inputs
+      shell: bash
+      run: |
+          owner="${REPOSITORY%%/*}"
+          if [[ -z "${owner}" || "${owner}" == "${REPOSITORY}" ]]; then
+              echo "repository must be owner/name" >&2
+              exit 1
+          fi
+
+          if [[ ! "${BRANCH_PREFIX}" =~ ^ci/[a-z0-9-]+$ ]]; then
+              echo "branch-prefix must match ci/<name> (name: lowercase ASCII letters, digits, hyphens)" >&2
+              exit 1
+          fi
+
+          if [[ "${DIRECTORY}" == /* ]]; then
+              echo "directory must be a relative path" >&2
+              exit 1
+          fi
+
+          if [[ "${DIRECTORY}" == *..* ]]; then
+              echo "directory must not contain .." >&2
+              exit 1
+          fi
+
+          if [[ ! "${DIRECTORY}" =~ ^(\./)?[a-zA-Z0-9._-]+(/[a-zA-Z0-9._-]+)*$ ]]; then
+              echo "directory must be a relative path of allowed ASCII segments (letters, digits, ., _, -)" >&2
+              exit 1
+          fi
+
+          resolved="$(realpath -e "${GITHUB_WORKSPACE}/${DIRECTORY#./}")"
+          case "${resolved}" in
+              "${GITHUB_WORKSPACE}"|"${GITHUB_WORKSPACE}"/*) ;;
+              *)
+                  echo "directory must stay inside the workspace" >&2
+                  exit 1
+                  ;;
+          esac
+
+          if [[ ! -d "${resolved}/.git" ]]; then
+              echo "directory must be an existing git checkout" >&2
+              exit 1
+          fi
+
+          {
+              echo "owner=${owner}"
+              echo "branch-prefix=${BRANCH_PREFIX}"
+              echo "directory=${resolved}"
+          } >> "${GITHUB_OUTPUT}"
+      env:
+        REPOSITORY: ${{ inputs.repository }}
+        BRANCH_PREFIX: ${{ inputs.branch-prefix }}
+        DIRECTORY: ${{ inputs.directory }}
+
+    - name: Generate GitHub App token
+      id: app-token
+      uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+      with:
+        client-id: ${{ inputs.app-client-id }}
+        private-key: ${{ inputs.app-private-key }}
+        owner: ${{ steps.inputs.outputs.owner }}
+        repositories: ${{ inputs.repository }}
+        permission-contents: write
+        permission-pull-requests: write
+
+    - name: Commit, Push and Create PR
+      env:
+        GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+        DIRECTORY: ${{ steps.inputs.outputs.directory }}
+        REPOSITORY: ${{ inputs.repository }}
+        BRANCH_PREFIX: ${{ steps.inputs.outputs.branch-prefix }}
+        CRED_CACHE_TIMEOUT: "60"
+        DRY_RUN: ${{ inputs.dry-run }}
+      run: |
+          cd "${DIRECTORY}"
+
+          write_job_summary() {
+              [[ -n "${GITHUB_STEP_SUMMARY:-}" ]] || return 0
+
+              {
+                  echo "## BTFHub Archive Update"
+                  echo ""
+                  case "${SUMMARY_RESULT}" in
+                      no_changes)
+                          echo "**Result:** No changes to commit"
+                          ;;
+                      skipped_duplicate)
+                          echo "**Result:** Skipped — existing PR already covers these files"
+                          ;;
+                      dry_run_ok)
+                          echo "**Result:** Dry run passed"
+                          ;;
+                      pr_created)
+                          echo "**Result:** Pull request created"
+                          ;;
+                  esac
+                  echo ""
+                  echo "| Field | Value |"
+                  echo "| --- | --- |"
+                  echo "| Repository | \`${REPOSITORY}\` |"
+                  [[ -n "${BRANCH_PREFIX:-}" ]] && echo "| Branch prefix | \`${BRANCH_PREFIX}\` |"
+                  [[ -n "${DISTROS:-}" ]] && echo "| Distros | ${DISTROS} |"
+                  [[ -n "${FILE_COUNT:-}" ]] && echo "| Files changed | ${FILE_COUNT} |"
+                  [[ -n "${BOT_LOGIN:-}" ]] && echo "| Author | \`${BOT_LOGIN}\` |"
+                  if [[ -n "${COMMIT_SHA:-}" ]]; then
+                      echo "| Commit | [\`${COMMIT_SHA:0:7}\`](https://github.com/${REPOSITORY}/commit/${COMMIT_SHA}) |"
+                  fi
+                  if [[ -n "${BRANCH:-}" ]]; then
+                      if [[ "${BRANCH_DELETED:-}" == "true" ]]; then
+                          echo "| Branch | \`${BRANCH}\` (deleted) |"
+                      else
+                          echo "| Branch | [\`${BRANCH}\`](https://github.com/${REPOSITORY}/tree/${BRANCH}) |"
+                      fi
+                  fi
+                  [[ -n "${ATTRIBUTED_LOGIN:-}" ]] && echo "| Attributed as | \`${ATTRIBUTED_LOGIN}\` |"
+                  [[ -n "${EXISTING_PR:-}" ]] && echo "| Existing PR | ${EXISTING_PR} |"
+                  [[ -n "${SUPERSEDED_PR:-}" ]] && echo "| Superseded PR | ${SUPERSEDED_PR} |"
+                  [[ -n "${PR_URL:-}" ]] && echo "| Pull request | ${PR_URL} |"
+                  [[ "${DRY_RUN}" == "true" ]] && echo "| Dry run | yes |"
+              } >> "${GITHUB_STEP_SUMMARY}" 2>/dev/null || true
+          }
+
+          if [[ "${DRY_RUN}" == "true" ]]; then
+              echo "=== DRY RUN: creating mock change ==="
+              mkdir -p _test
+              date > _test/credential-cache-test.txt
+          fi
+
+          git add --sparse -A
+          if git diff --cached --quiet; then
+              echo "No changes to commit"
+              SUMMARY_RESULT=no_changes
+              write_job_summary
+              exit 0
+          fi
+
+          # Detect distros from changed file paths (top-level directories)
+          DISTROS=$(git diff --cached --name-only | cut -d'/' -f1 | sort -u | paste -sd ', ')
+          FILE_COUNT=$(git diff --cached --name-only | wc -l | tr -d ' ')
+          echo "Detected distros: ${DISTROS}"
+
+          git diff --cached --stat
+
+          # Deduplication: skip or supersede an existing open PR for this branch prefix.
+          # (Skipped in dry-run because the mock file would produce a false mismatch.)
+          SUPERSEDED_PR=""
+          if [[ "${DRY_RUN}" != "true" ]]; then
+              STAGED_FILES=$(git diff --cached --name-only | sort)
+
+              EXISTING_PR_NUMBER=$(gh pr list \
+                  --repo "${REPOSITORY}" \
+                  --base main \
+                  --state open \
+                  --json number,headRefName \
+                  --jq "[.[] | select(.headRefName | startswith(\"${BRANCH_PREFIX}-\"))] | first | .number // empty")
+
+              if [[ -n "${EXISTING_PR_NUMBER}" ]]; then
+                  echo "Found existing open PR #${EXISTING_PR_NUMBER} with prefix ${BRANCH_PREFIX}"
+
+                  EXISTING_FILES=$(gh pr view "${EXISTING_PR_NUMBER}" \
+                      --repo "${REPOSITORY}" \
+                      --json files \
+                      --jq '.files[].path' | sort)
+
+                  # Lines present in STAGED_FILES but absent from EXISTING_FILES
+                  NEW_FILES=$(comm -23 <(echo "${STAGED_FILES}") <(echo "${EXISTING_FILES}"))
+
+                  if [[ -z "${NEW_FILES}" ]]; then
+                      EXISTING_PR=$(gh pr view "${EXISTING_PR_NUMBER}" \
+                          --repo "${REPOSITORY}" \
+                          --json url --jq .url)
+                      gh pr comment "${EXISTING_PR_NUMBER}" \
+                          --repo "${REPOSITORY}" \
+                          --body "Cron run on $(date -u '+%Y-%m-%d') produced the same set of BTF files already tracked by this PR. No new PR created."
+                      SUMMARY_RESULT=skipped_duplicate
+                      write_job_summary
+                      exit 0
+                  fi
+
+                  NEW_FILES_LIST=$(echo "${NEW_FILES}" | paste -sd ', ')
+                  echo "Additional files vs PR #${EXISTING_PR_NUMBER}: ${NEW_FILES_LIST}. Closing old PR."
+                  SUPERSEDED_PR=$(gh pr view "${EXISTING_PR_NUMBER}" \
+                      --repo "${REPOSITORY}" \
+                      --json url --jq .url)
+                  gh pr comment "${EXISTING_PR_NUMBER}" \
+                      --repo "${REPOSITORY}" \
+                      --body "Closing in favour of a new PR that includes additional BTF files not present here: \`${NEW_FILES_LIST}\`."
+                  gh pr close "${EXISTING_PR_NUMBER}" --repo "${REPOSITORY}"
+              fi
+          fi
+
+          mapfile -t _bot < <(gh api "/users/${APP_SLUG}[bot]" --jq '[.type, .login, (.id|tostring)] | .[]')
+          if [[ ${#_bot[@]} -ne 3 ]]; then
+              echo "Failed to resolve GitHub App bot user for ${APP_SLUG}[bot]" >&2
+              exit 1
+          fi
+          BOT_TYPE="${_bot[0]}"
+          BOT_LOGIN="${_bot[1]}"
+          BOT_ID="${_bot[2]}"
+          EXPECTED_EMAIL="${BOT_ID}+${BOT_LOGIN}@users.noreply.github.com"
+          git config user.name "${BOT_LOGIN}"
+          git config user.email "${EXPECTED_EMAIL}"
+
+          if [[ "${BOT_TYPE}" != "Bot" ]]; then
+              echo "GitHub App bot user type is ${BOT_TYPE}, expected Bot" >&2
+              exit 1
+          fi
+          if [[ "$(git config user.name)" != "${BOT_LOGIN}" ]]; then
+              echo "git user.name mismatch: $(git config user.name) != ${BOT_LOGIN}" >&2
+              exit 1
+          fi
+          if [[ "$(git config user.email)" != "${EXPECTED_EMAIL}" ]]; then
+              echo "git user.email mismatch: $(git config user.email) != ${EXPECTED_EMAIL}" >&2
+              exit 1
+          fi
+
+          BRANCH="${BRANCH_PREFIX}-$(date +%Y%m%d%H%M%S)"
+          git checkout -b "${BRANCH}"
+          git commit -m "Update BTF archive: ${DISTROS}"
+          git remote set-url origin "https://x-access-token@github.com/${REPOSITORY}.git"
+
+          # Store the token in git's in-memory credential cache (Unix socket daemon).
+          # The token never touches disk or command-line args.
+          SOCK_DIR="$(mktemp -d)"
+          CRED_SOCK="${SOCK_DIR}/credential-cache.sock"
+          cleanup_creds() { git credential-cache --socket="${CRED_SOCK}" exit 2>/dev/null; rm -rf "${SOCK_DIR}"; }
+          trap cleanup_creds EXIT
+          git config credential.helper "cache --timeout=${CRED_CACHE_TIMEOUT} --socket=${CRED_SOCK}"
+          printf 'protocol=https\nhost=github.com\nusername=x-access-token\npassword=%s\n\n' "${GH_TOKEN}" \
+              | git credential approve
+
+          git push -u origin "${BRANCH}"
+
+          COMMIT_SHA=$(git rev-parse HEAD)
+          mapfile -t _commit < <(gh api "/repos/${REPOSITORY}/commits/${COMMIT_SHA}" \
+              --jq '[.author.login // "", .commit.author.name, .commit.author.email] | .[]')
+          ATTRIBUTED_LOGIN="${_commit[0]}"
+          AUTHOR_NAME="${_commit[1]}"
+          AUTHOR_EMAIL="${_commit[2]}"
+
+          if [[ "${AUTHOR_NAME}" != "${BOT_LOGIN}" || "${AUTHOR_EMAIL}" != "${EXPECTED_EMAIL}" ]]; then
+              echo "Commit attribution mismatch:" >&2
+              echo "  expected name=${BOT_LOGIN} email=${EXPECTED_EMAIL}" >&2
+              echo "  got name=${AUTHOR_NAME} email=${AUTHOR_EMAIL}" >&2
+              exit 1
+          fi
+          if [[ -n "${ATTRIBUTED_LOGIN}" && "${ATTRIBUTED_LOGIN}" != "${BOT_LOGIN}" ]]; then
+              echo "Linked author login mismatch: ${ATTRIBUTED_LOGIN} != ${BOT_LOGIN}" >&2
+              exit 1
+          fi
+
+          if [[ "${DRY_RUN}" == "true" ]]; then
+              git push origin --delete "${BRANCH}"
+              BRANCH_DELETED=true
+              cleanup_creds
+              SUMMARY_RESULT=dry_run_ok
+              write_job_summary
+              exit 0
+          fi
+
+          cleanup_creds
+
+          gh pr create \
+              --repo "${REPOSITORY}" \
+              --base main \
+              --head "${BRANCH}" \
+              --title "Update BTF archive: ${DISTROS}" \
+              --body "Automated update of BTF files for: ${DISTROS}."
+
+          PR_URL=$(gh pr view "${BRANCH}" \
+              --repo "${REPOSITORY}" \
+              --json url --jq .url)
+
+          SUMMARY_RESULT=pr_created
+          write_job_summary
+      shell: bash

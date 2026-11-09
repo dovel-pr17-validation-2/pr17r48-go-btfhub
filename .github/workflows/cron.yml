@@ -1,0 +1,296 @@
+name: Update BTFHub Archive
+
+permissions: {}
+
+env:
+  ARCHIVE_REPO: aquasecurity/btfhub-archive
+
+on:
+  schedule:
+    - cron: "0 1 * * *"
+
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: "Test credential flow: push a mock change and delete the branch (no PR created)"
+        type: boolean
+        default: false
+
+jobs:
+  amazon-update:
+    name: Update Amazon 2 BTF Archive
+    runs-on: ubuntu-2404-4core
+    container:
+      image: amazonlinux:2023
+    permissions:
+      contents: read # actions/setup-go cache save/restore
+    steps:
+      - name: Install needed amazon packages
+        if: inputs.dry-run != true
+        run: |
+          dnf install -y dnf-utils tar gzip xz clang make cmake git libdwarf-devel elfutils-libelf-devel elfutils-devel rsync
+        shell: bash
+      #
+      - name: Install GitHub CLI
+        run: |
+          dnf install -y 'dnf-command(config-manager)'
+          dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo
+          dnf install -y gh
+        shell: bash
+      #
+      - name: Configure Git for HTTPS
+        run: |
+          # Force Git to use HTTPS instead of SSH to avoid terminal auth prompts
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+        shell: bash
+      #
+      - name: Checkout BTFHub
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: aquasecurity/btfhub
+          submodules: ${{ inputs.dry-run != true && 'recursive' || 'false' }}
+          path: ./btfhub
+      #
+      - name: Set up Go
+        if: inputs.dry-run != true
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.25"
+          cache-dependency-path: btfhub/go.sum
+      #
+      - name: Configure Go Proxy
+        if: inputs.dry-run != true
+        run: |
+          # Ensure Go uses the public proxy to pull pre-indexed modules
+          # This bypasses the need for local git authentication for public repos
+          go env -w GOPROXY=https://proxy.golang.org,direct
+        shell: bash
+      #
+      - name: Setup Amazon Debuginfo Repositories
+        if: inputs.dry-run != true
+        run: |
+          # disable default debuginfo repositories
+          dnf config-manager --set-disabled amazonlinux-debuginfo
+
+          # add Amazon Linux 2 debuginfo repositories
+          append_repo() {
+              local arch=$1
+              local repo_name="amzn2-core-debuginfo-$arch"
+
+              echo "[$repo_name]
+          name=Amazon Linux 2 core repository - debuginfo packages $arch
+          mirrorlist=http://amazonlinux.default.amazonaws.com/2/core/latest/debuginfo/$arch/mirror.list
+          enabled=1
+          "
+          }
+
+          cat << EOF >> /etc/yum.repos.d/amazonlinux.repo
+          $(append_repo "x86_64")
+          $(append_repo "aarch64")
+          EOF
+        shell: bash
+      #
+      - name: Build and install pahole
+        if: inputs.dry-run != true
+        run: |
+          cd btfhub/3rdparty/dwarves
+          mkdir build
+          cd build
+          cmake -D__LIB=lib -DDWARF_INCLUDE_DIR=/usr/include ..
+          make install
+          echo "/usr/local/lib" >> /etc/ld.so.conf.d/pahole.conf
+          ldconfig
+        shell: bash
+      #
+      # - name: Build and install bpftool
+      #   run: |
+      #     cd btfhub/3rdparty/bpftool
+      #     make -C src clean
+      #     CC=clang make -C src all
+      #     cp ./src/bpftool /usr/sbin/bpftool
+      #     make -C src clean
+      #   shell: bash
+      #
+      - name: Compile BTFHub Tool
+        if: inputs.dry-run != true
+        run: |
+          cd btfhub
+          make
+        shell: bash
+      #
+      - name: Checkout BTFHub Archive
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.ARCHIVE_REPO }}
+          persist-credentials: false
+          fetch-depth: 1
+          path: ./btfhub-archive
+          sparse-checkout: ${{ inputs.dry-run == true && 'README.md' || 'amzn' }}
+      #
+      - name: Bring current BTFHub Archive
+        if: inputs.dry-run != true
+        run: |
+          cd btfhub
+          make bring
+        shell: bash
+      #
+      - name: Fetch and Generate new BTFs (AMAZON 2)
+        if: inputs.dry-run != true
+        run: |
+          cd btfhub
+          ./btfhub -workers 6 -d amzn -r 2
+      #
+      - name: Take new BTFs to BTFHub Archive
+        if: inputs.dry-run != true
+        run: |
+          cd btfhub
+          make take
+      #
+      - name: Commit, Push and Create PR for BTFHub Archive
+        uses: ./btfhub/.github/actions/commit-push-and-pr
+        with:
+          directory: ./btfhub-archive
+          repository: ${{ env.ARCHIVE_REPO }}
+          branch-prefix: ci/amazon
+          app-client-id: ${{ secrets.REPO_BTFHUB_ARCHIVE_WRITE_GH_APP_CLIENT_ID }}
+          app-private-key: ${{ secrets.REPO_BTFHUB_ARCHIVE_WRITE_GH_APP_PRIVATE_KEY }}
+          dry-run: ${{ inputs.dry-run && 'true' || 'false' }}
+
+  other-distros:
+    name: Update Other Distros BTF Archive
+    permissions:
+      contents: read # actions/cache save/restore
+    env:
+      HOME: "/tmp/root"
+      GOPATH: "/tmp/go"
+      GOCACHE: "/tmp/go-cache"
+      GOROOT: "/usr/local/go"
+    # btf-80GiB-ubuntu-24.04-generic-6.11.0-29-x86_64
+    runs-on:
+      - graas_ami-0b7b78bd2ebf4bb80_${{ github.event.number }}${{ github.run_attempt }}-${{ github.run_id }}
+      - EXECUTION_TYPE=LONG
+    steps:
+      #
+      - name: Setup Swap File
+        if: inputs.dry-run != true
+        run: |
+          fallocate -l 16G /swapfile
+          chmod 600 /swapfile
+          mkswap /swapfile
+          swapon /swapfile
+        shell: bash
+      #
+      - name: Checkout BTFHub
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: aquasecurity/btfhub
+          path: ./btfhub
+      #
+      - name: "Prepare Image (Fix AMI)"
+        if: inputs.dry-run != true
+        uses: ./btfhub/.github/actions/build-dependencies
+        with:
+          run-on: ./btfhub
+          from: cron
+      #
+      - name: Cache Go modules
+        if: inputs.dry-run != true
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ env.GOPATH }}/pkg/mod
+            ${{ env.GOCACHE }}
+          key: ${{ runner.os }}-${{ runner.arch }}-go-graas-${{ hashFiles('**/go.mod') }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-go-graas-${{ hashFiles('**/go.mod') }}-
+      #
+      - name: Install GitHub CLI
+        run: |
+          apt-get update
+          apt-get install -y gh
+        shell: bash
+      #
+      - name: Checkout BTFHub Archive
+        if: inputs.dry-run != true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.ARCHIVE_REPO }}
+          persist-credentials: false
+          fetch-depth: 1
+          path: ./btfhub-archive
+          sparse-checkout: |
+            centos
+            debian
+            fedora
+            ol
+            ubuntu
+      #
+      - name: Checkout BTFHub Archive (dry-run)
+        if: inputs.dry-run == true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.ARCHIVE_REPO }}
+          persist-credentials: false
+          fetch-depth: 1
+          path: ./btfhub-archive
+          sparse-checkout: README.md
+      #
+      - name: Bring current BTFHub Archive
+        if: inputs.dry-run != true
+        run: |
+          cd btfhub
+          make bring
+        shell: bash
+      #
+      - name: Compile BTFHub Tool
+        if: inputs.dry-run != true
+        run: |
+          cd btfhub
+          make
+        shell: bash
+      #
+      - name: Fetch and Generate new BTFs (CENTOS)
+        if: inputs.dry-run != true
+        run: |
+          cd btfhub
+          ./btfhub -workers 6 -d centos
+      # public debian stretch and buster are gone, updates for bullseye only
+      # https://en.wikipedia.org/wiki/Debian_version_history#Release_table
+      - name: Fetch and Generate new BTFs (DEBIAN)
+        if: inputs.dry-run != true
+        run: |
+          cd btfhub
+          ./btfhub -workers 6 -d debian -r bullseye
+      #
+      - name: Fetch and Generate new BTFs (FEDORA)
+        if: inputs.dry-run != true
+        run: |
+          cd btfhub
+          ./btfhub -workers 6 -d fedora
+      #
+      - name: Fetch and Generate new BTFs (ORACLE)
+        if: inputs.dry-run != true
+        run: |
+          cd btfhub
+          ./btfhub -workers 6 -d ol
+      #
+      - name: Fetch and Generate new BTFs (UBUNTU)
+        if: inputs.dry-run != true
+        run: |
+          cd btfhub
+          ./btfhub -workers 6 -d ubuntu
+      #
+      - name: Take new BTFs to BTFHub Archive
+        if: inputs.dry-run != true
+        run: |
+          cd btfhub
+          make take
+      #
+      - name: Commit, Push and Create PR for BTFHub Archive
+        uses: ./btfhub/.github/actions/commit-push-and-pr
+        with:
+          directory: ./btfhub-archive
+          repository: ${{ env.ARCHIVE_REPO }}
+          branch-prefix: ci/other-distros
+          app-client-id: ${{ secrets.REPO_BTFHUB_ARCHIVE_WRITE_GH_APP_CLIENT_ID }}
+          app-private-key: ${{ secrets.REPO_BTFHUB_ARCHIVE_WRITE_GH_APP_PRIVATE_KEY }}
+          dry-run: ${{ inputs.dry-run && 'true' || 'false' }}
